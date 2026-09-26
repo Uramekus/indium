@@ -40,8 +40,20 @@ Iridium::AIR::Function::Function(Type type, const std::string& name, const void*
 
 // TEST
 #include <iostream>
+#include <string>
 
-class ImpossibleResultID: public std::exception {};
+// Thrown when AIR uses something the translation does not implement. The
+// message names the unsupported construct, so a failure identifies itself
+// instead of surfacing as a bare "std::exception".
+class ImpossibleResultID: public std::exception {
+	std::string _message;
+
+public:
+	explicit ImpossibleResultID(std::string message):
+		_message(std::move(message)) {}
+
+	const char* what() const noexcept override { return _message.c_str(); }
+};
 
 static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& builder, LLVMTypeRef llvmType) {
 	using namespace Iridium::SPIRV;
@@ -128,9 +140,8 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 			// resolve themselves; a bare pointer type here carries no pointee
 			// we could recover, so fail explicitly instead.
 			auto addrSpace = DynamicLLVM::LLVMGetPointerAddressSpace(llvmType);
-			fprintf(stderr, "Iridium: cannot resolve pointee of opaque pointer (addrspace %u); "
-				"derive it from AIR argument metadata\n", (unsigned)addrSpace);
-			throw ImpossibleResultID();
+			throw ImpossibleResultID("cannot resolve pointee of opaque pointer (addrspace "
+				+ std::to_string((unsigned)addrSpace) + ")");
 		} break;
 
 		case LLVMVectorTypeKind: {
@@ -148,7 +159,7 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 		} break;
 
 		default:
-			throw ImpossibleResultID();
+			throw ImpossibleResultID("unhandled LLVM type kind " + std::to_string((int)kind));
 	}
 };
 
@@ -204,7 +215,7 @@ static Iridium::SPIRV::Type spirvTypeForMetalTypeName(std::string_view name) {
 		return Type(Type::IntegerTag {}, width, false);
 	}
 
-	throw ImpossibleResultID();
+	throw ImpossibleResultID("unmapped Metal type name \"" + std::string(name) + "\"");
 }
 
 static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& builder, LLVMValueRef llvmValue) {
@@ -246,7 +257,7 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
 				} break;
 
 				default:
-					throw ImpossibleResultID();
+					throw ImpossibleResultID("unsupported float constant type kind " + std::to_string((int)typeKind));
 			}
 		} break;
 
@@ -309,12 +320,12 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
 				} break;
 
 				default:
-					throw ImpossibleResultID();
+					throw ImpossibleResultID("unsupported LLVM value kind " + std::to_string((int)kind));
 			}
 		} break;
 
 		default:
-			throw ImpossibleResultID();
+			throw ImpossibleResultID("unsupported LLVM value kind " + std::to_string((int)kind));
 	}
 };
 
@@ -580,7 +591,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 			if (kind == "air.buffer") {
 				auto typeNameNode = findAIMDValue(parameterOperand, "air.arg_type_name");
 				if (!typeNameNode) {
-					throw ImpossibleResultID();
+					throw ImpossibleResultID("air.buffer descriptor has no air.arg_type_name");
 				}
 				auto type = builder.declareType(spirvTypeForMetalTypeName(llvmMDStringToStringView(typeNameNode)));
 				auto addrPtrTypeInst = SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::PhysicalStorageBuffer, type, 8);
