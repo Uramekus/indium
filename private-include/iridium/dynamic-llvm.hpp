@@ -6,6 +6,8 @@
 #include <dlfcn.h>
 
 #include <mutex>
+#include <stdexcept>
+#include <string>
 
 namespace Iridium {
 	namespace DynamicLLVM {
@@ -77,6 +79,7 @@ namespace Iridium {
 			_macro(LLVMGetElementAsConstant) \
 			_macro(LLVMGetElementType) \
 			_macro(LLVMGetFCmpPredicate) \
+			_macro(LLVMGetGEPSourceElementType) \
 			_macro(LLVMGetFirstBasicBlock) \
 			_macro(LLVMGetFirstInstruction) \
 			_macro(LLVMGetFirstNamedMetadata) \
@@ -107,11 +110,14 @@ namespace Iridium {
 			_macro(LLVMGetPointerAddressSpace) \
 			_macro(LLVMGetReturnType) \
 			_macro(LLVMGetSuccessor) \
+			_macro(LLVMGetTypeByName) \
 			_macro(LLVMGetTypeKind) \
 			_macro(LLVMGetUndefMaskElem) \
 			_macro(LLVMGetValueKind) \
 			_macro(LLVMGetValueName2) \
 			_macro(LLVMGetVectorSize) \
+			_macro(LLVMGlobalGetValueType) \
+			_macro(LLVMIsAConstantInt) \
 			_macro(LLVMIsAMDString) \
 			_macro(LLVMIsConditional) \
 			_macro(LLVMIsPackedStruct) \

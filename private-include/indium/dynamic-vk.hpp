@@ -6,6 +6,8 @@
 #include <indium/instance.private.hpp>
 
 #include <mutex>
+#include <stdexcept>
+#include <string>
 
 namespace Indium {
 	namespace DynamicVK {
@@ -155,6 +157,7 @@ namespace Indium {
 			_macro(vkGetBufferMemoryRequirements) \
 			_macro(vkGetDeviceQueue) \
 			_macro(vkGetImageMemoryRequirements) \
+			_macro(vkGetImageSubresourceLayout) \
 			_macro(vkGetPhysicalDeviceFeatures2) \
 			_macro(vkGetPhysicalDeviceMemoryProperties) \
 			_macro(vkGetPhysicalDeviceProperties) \

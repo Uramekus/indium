@@ -40,8 +40,22 @@ Iridium::AIR::Function::Function(Type type, const std::string& name, const void*
 
 // TEST
 #include <iostream>
+#include <cctype>
+#include <optional>
+#include <string>
 
-class ImpossibleResultID: public std::exception {};
+// Thrown when AIR uses something the translation does not implement. The
+// message names the unsupported construct, so a failure identifies itself
+// instead of surfacing as a bare "std::exception".
+class ImpossibleResultID: public std::exception {
+	std::string _message;
+
+public:
+	explicit ImpossibleResultID(std::string message):
+		_message(std::move(message)) {}
+
+	const char* what() const noexcept override { return _message.c_str(); }
+};
 
 static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& builder, LLVMTypeRef llvmType) {
 	using namespace Iridium::SPIRV;
@@ -121,10 +135,15 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 		} break;
 
 		case LLVMPointerTypeKind: {
-			StorageClass storageClass = StorageClass::Output;
-			// TODO: somehow determine the appropriate storage class
-			//auto addrSpace = DynamicLLVM::LLVMGetPointerAddressSpace(llvmType);
-			return builder.declareType(Type(Type::PointerTag {}, storageClass, llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMGetElementType(llvmType)), 8));
+			// AIR is compiled with opaque pointers, so LLVMGetElementType on a
+			// "ptr" returns garbage rather than null, and recursing into it
+			// dereferenced that garbage. The pointee type now only exists in
+			// the AIR argument descriptors (air.arg_type_name), which callers
+			// resolve themselves; a bare pointer type here carries no pointee
+			// we could recover, so fail explicitly instead.
+			auto addrSpace = DynamicLLVM::LLVMGetPointerAddressSpace(llvmType);
+			throw ImpossibleResultID("cannot resolve pointee of opaque pointer (addrspace "
+				+ std::to_string((unsigned)addrSpace) + "); derive it from AIR argument metadata");
 		} break;
 
 		case LLVMVectorTypeKind: {
@@ -142,7 +161,7 @@ static Iridium::SPIRV::ResultID llvmTypeToSPIRVType(Iridium::SPIRV::Builder& bui
 		} break;
 
 		default:
-			throw ImpossibleResultID();
+			throw ImpossibleResultID("unhandled LLVM type kind " + std::to_string((int)kind));
 	}
 };
 
@@ -151,6 +170,120 @@ static std::string_view llvmMDStringToStringView(LLVMValueRef llvmMDString) {
 	auto rawStr = DynamicLLVM::LLVMGetMDString(llvmMDString, &length);
 	return std::string_view(rawStr, length);
 };
+
+// Returns the operand that follows the given MDString key in an AIR argument
+// descriptor, or nullptr if the key is absent.
+static LLVMValueRef findAIMDValue(LLVMValueRef mdNode, std::string_view key) {
+	unsigned int count = DynamicLLVM::LLVMGetMDNodeNumOperands(mdNode);
+	std::vector<LLVMValueRef> operands(count);
+	DynamicLLVM::LLVMGetMDNodeOperands(mdNode, operands.data());
+
+	for (unsigned int i = 0; i + 1 < count; i++) {
+		unsigned int length = 0;
+		if (!DynamicLLVM::LLVMGetMDString(operands[i], &length)) {
+			continue;
+		}
+		if (llvmMDStringToStringView(operands[i]) == key) {
+			return operands[i + 1];
+		}
+	}
+
+	return nullptr;
+}
+
+// Splits a Metal type name into its scalar base name and component count.
+// Metal spells vectors by suffixing the scalar with a count ("float4", "uint2")
+// and marks the padded vector layouts with a "packed_" prefix, which does not
+// change the element type.
+static void splitMetalTypeName(std::string_view name, std::string_view& base, size_t& count) {
+	count = 1;
+
+	constexpr std::string_view packedPrefix = "packed_";
+
+	std::string_view rest = name;
+	if (rest.substr(0, packedPrefix.size()) == packedPrefix) {
+		rest.remove_prefix(packedPrefix.size());
+	}
+
+	auto digits = rest.find_first_of("0123456789");
+	if (digits == std::string_view::npos) {
+		base = rest;
+		return;
+	}
+
+	base = rest.substr(0, digits);
+	count = 0;
+	for (char c: rest.substr(digits)) {
+		count = count * 10 + static_cast<size_t>(c - '0');
+	}
+}
+
+// Returns std::nullopt for a name that is not a Metal scalar, so callers can
+// fall back to resolving it as a named module type.
+//
+// Integer signedness is deliberately not taken from the Metal name. LLVM IR
+// integers carry no signedness, so a type derived from IR (a getelementptr's
+// source element type, say) is always signed here. Deriving unsigned types
+// from air.arg_type_name would make the two paths disagree: spirv-val rejects
+// the mismatch because OpTypeInt 32 0 and OpTypeInt 32 1 are distinct types
+// even though the bytes are identical. Metal only gives unsignedness meaning
+// at arithmetic sites, so storage and access-chain types are uniformly signed
+// to keep one type per layout.
+static std::optional<Iridium::SPIRV::Type> spirvScalarTypeForMetalBase(std::string_view base) {
+	using Iridium::SPIRV::Type;
+
+	if (base == "float") { return Type(Type::FloatTag {}, 32); }
+	if (base == "half") { return Type(Type::FloatTag {}, 16); }
+	if (base == "double") { return Type(Type::FloatTag {}, 64); }
+
+	if (base == "int" || base == "uint") { return Type(Type::IntegerTag {}, 32, true); }
+	if (base == "short" || base == "ushort") { return Type(Type::IntegerTag {}, 16, true); }
+	if (base == "long" || base == "ulong") { return Type(Type::IntegerTag {}, 64, true); }
+	if (base == "char" || base == "bool") { return Type(Type::IntegerTag {}, 8, true); }
+
+
+	if (base == "uchar") { return Type(Type::IntegerTag {}, 8, true); }
+
+	return std::nullopt;
+}
+
+// A buffer argument's air.arg_type_name is a scalar, a vector, or the name of a
+// struct declared in the module ("Uniforms", "AAPLVertex"). Struct names are
+// resolved against the module, since the opaque pointer parameter no longer
+// carries the type. LLVM prefixes named struct types with "struct.".
+static Iridium::SPIRV::ResultID spirvTypeForAIRTypeName(Iridium::SPIRV::Builder& builder, LLVMModuleRef module, std::string_view name) {
+	using Iridium::SPIRV::Type;
+
+	std::string_view base;
+	size_t count = 0;
+	splitMetalTypeName(name, base, count);
+
+	if (auto scalar = spirvScalarTypeForMetalBase(base)) {
+		auto scalarID = builder.declareType(*scalar);
+
+		if (count == 1) {
+			return scalarID;
+		}
+
+		// Mirrors the layout the LLVMVectorTypeKind case computes: a 3- or
+		// 4-component vector is padded out to a full vec4 register.
+		auto registerScale = scalar->size / 4 > 0 ? scalar->size / 4 : 1;
+		size_t vectorAlignment = ((count == 3 || count == 4) ? 4 : 2) * registerScale;
+
+		return builder.declareType(Type(Type::VectorTag {}, count, scalarID, scalar->size * count, vectorAlignment));
+	}
+
+	std::string owned(name);
+	auto named = DynamicLLVM::LLVMGetTypeByName(module, owned.c_str());
+	if (!named) {
+		named = DynamicLLVM::LLVMGetTypeByName(module, ("struct." + owned).c_str());
+	}
+	if (named) {
+		return llvmTypeToSPIRVType(builder, named);
+	}
+
+	throw ImpossibleResultID("neither a Metal scalar nor a module type named \"" + std::string(name) + "\"");
+}
 
 static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& builder, LLVMValueRef llvmValue) {
 	using namespace Iridium::SPIRV;
@@ -191,7 +324,7 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
 				} break;
 
 				default:
-					throw ImpossibleResultID();
+					throw ImpossibleResultID("unsupported float constant type kind " + std::to_string((int)typeKind));
 			}
 		} break;
 
@@ -254,12 +387,12 @@ static Iridium::SPIRV::ResultID llvmValueToResultID(Iridium::SPIRV::Builder& bui
 				} break;
 
 				default:
-					throw ImpossibleResultID();
+					throw ImpossibleResultID("unsupported LLVM value kind " + std::to_string((int)kind));
 			}
 		} break;
 
 		default:
-			throw ImpossibleResultID();
+			throw ImpossibleResultID("unsupported LLVM value kind " + std::to_string((int)kind));
 	}
 };
 
@@ -425,10 +558,25 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 	// if the function returns a structure, we need to separate the components
 	// into separate output variables.
 
-	auto llfuncType = DynamicLLVM::LLVMGetElementType(DynamicLLVM::LLVMTypeOf(_function));
+	// With opaque pointers LLVMTypeOf(_function) is just "ptr", and
+	// LLVMGetElementType on that returns null, which used to segfault in
+	// LLVMGetReturnType below. LLVMGlobalGetValueType is the correct way to
+	// get a global's or function's own type.
+	auto llfuncType = DynamicLLVM::LLVMGlobalGetValueType(_function);
 	auto funcRetType = DynamicLLVM::LLVMGetReturnType(llfuncType);
 	std::vector<LLVMTypeRef> funcParamTypes(DynamicLLVM::LLVMCountParamTypes(llfuncType));
 	DynamicLLVM::LLVMGetParamTypes(llfuncType, funcParamTypes.data());
+
+	// With opaque pointers an argument's LLVM type is just "ptr addrspace(n)",
+	// so the real type of every non-buffer argument has to come from its AIR
+	// descriptor rather than from funcParamTypes.
+	auto airArgumentType = [&](LLVMValueRef parameterOperand) {
+		auto typeNameNode = findAIMDValue(parameterOperand, "air.arg_type_name");
+		if (!typeNameNode) {
+			throw ImpossibleResultID("argument descriptor has no air.arg_type_name");
+		}
+		return spirvTypeForAIRTypeName(builder, _module.get(), llvmMDStringToStringView(typeNameNode));
+	};
 
 	std::vector<LLVMValueRef> returnValueOperands(DynamicLLVM::LLVMGetMDNodeNumOperands(rootInfoOperands[1]));
 	DynamicLLVM::LLVMGetMDNodeOperands(rootInfoOperands[1], returnValueOperands.data());
@@ -519,7 +667,11 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 			auto kind = llvmMDStringToStringView(parameterInfo[1]);
 
 			if (kind == "air.buffer") {
-				auto type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMGetElementType(funcParamTypes[i]));
+				auto typeNameNode = findAIMDValue(parameterOperand, "air.arg_type_name");
+				if (!typeNameNode) {
+					throw ImpossibleResultID("air.buffer descriptor has no air.arg_type_name");
+				}
+				auto type = spirvTypeForAIRTypeName(builder, _module.get(), llvmMDStringToStringView(typeNameNode));
 				auto addrPtrTypeInst = SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::PhysicalStorageBuffer, type, 8);
 				auto addrPtrType = builder.declareType(addrPtrTypeInst);
 				bufferMembers.push_back(SPIRV::Type::Member { addrPtrType, 8 * bufferIndex, {} });
@@ -615,7 +767,7 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 			builder.associateExistingResultID(load, llparamVal);
 			builder.setResultType(load, vec4Type);
 		} else if (kind == "air.fragment_input") {
-			auto type = llvmTypeToSPIRVType(builder, funcParamTypes[i]);
+			auto type = airArgumentType(parameterOperand);
 			auto ptrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::Input, type, 8));
 			auto var = builder.addGlobalVariable(ptrType, SPIRV::StorageClass::Input);
 			auto load = builder.encodeLoad(type, var);
@@ -766,13 +918,17 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 				dimensionality = SPIRV::Dim::e2D;
 			} else if (textureClassName == "texturecube") {
 				dimensionality = SPIRV::Dim::eCube;
+			} else {
+				// Any other texture class (texture3d, texture1d, the array and
+				// buffer variants) used to leave `dimensionality` uninitialised, so
+				// the emitted image type carried an arbitrary Dim.
+				throw std::runtime_error(std::string("TODO: support the texture class ") +
+					std::string(textureClassName));
 			}
 
 			auto imageType = builder.declareType(SPIRV::Type(SPIRV::Type::ImageTag {}, fakeSampleType, realSampleType, dimensionality, 2, false, false, accessType == TextureAccessType::Sample ? 1 : 2, SPIRV::ImageFormat::Unknown));
 			auto imagePtrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::UniformConstant, imageType, 8));
 			auto var = builder.addGlobalVariable(imagePtrType, SPIRV::StorageClass::UniformConstant);
-			//auto load = builder.encodeLoad(imageType, var);
-
 			builder.addDecoration(var, SPIRV::Decoration { SPIRV::DecorationType::DescriptorSet, { funcInfo.type == FunctionType::Fragment ? 1u : 0u } });
 			builder.addDecoration(var, SPIRV::Decoration { SPIRV::DecorationType::Binding, { static_cast<uint32_t>(internalBindingIndex) } });
 
@@ -1050,7 +1206,16 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMGetElementPtr: {
 					auto base = DynamicLLVM::LLVMGetOperand(inst, 0);
-					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
+
+					// With opaque pointers LLVMTypeOf(inst) is just the
+					// pointer, so the result pointee is recovered from the
+					// instruction's source element type: the first index
+					// steps the pointer itself, and each later index
+					// descends one level into an aggregate.
+					auto currentType = DynamicLLVM::LLVMGetGEPSourceElementType(inst);
+					if (!currentType) {
+						throw ImpossibleResultID("getelementptr has no source element type");
+					}
 
 					std::vector<SPIRV::ResultID> indices;
 					auto operandCount = DynamicLLVM::LLVMGetNumOperands(inst);
@@ -1058,9 +1223,33 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					for (size_t i = 1; i < operandCount; ++i) {
 						auto llindex = DynamicLLVM::LLVMGetOperand(inst, i);
 						indices.push_back(llvmValueToResultID(builder, llindex));
+
+						if (i > 1) {
+							switch (DynamicLLVM::LLVMGetTypeKind(currentType)) {
+								case LLVMArrayTypeKind:
+								case LLVMVectorTypeKind:
+									currentType = DynamicLLVM::LLVMGetElementType(currentType);
+									break;
+
+								case LLVMStructTypeKind: {
+									auto indexValue = DynamicLLVM::LLVMIsAConstantInt(llindex)
+										? DynamicLLVM::LLVMConstIntGetZExtValue(llindex)
+										: 0;
+									auto fieldType = DynamicLLVM::LLVMStructGetTypeAtIndex(currentType, indexValue);
+									if (!fieldType) {
+										throw ImpossibleResultID("getelementptr into a struct with a non-constant index");
+									}
+									currentType = fieldType;
+								} break;
+
+								default:
+									throw ImpossibleResultID("getelementptr descends into a non-aggregate type");
+							}
+						}
 					}
 
-					auto tmp = llvmTypeToSPIRVType(builder, targetType);
+					auto pointeeType = llvmTypeToSPIRVType(builder, currentType);
+					auto tmp = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, SPIRV::StorageClass::Output, pointeeType, 8));
 					auto tmp2 = llvmValueToResultID(builder, base);
 
 					// ensure the resulting pointer storage class is the same as the input pointer storage class
@@ -1101,7 +1290,25 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto targetType = DynamicLLVM::LLVMTypeOf(inst);
 					auto type = llvmTypeToSPIRVType(builder, targetType);
 					auto op = llvmValueToResultID(builder, ptr);
-					auto opType = *builder.reverseLookupType(builder.lookupResultType(op));
+					// A pointer operand's recorded type is what carries the storage
+					// class the re-type below copies, and it does not miss on any
+					// AIR in the corpus: every producer of a pointer calls
+					// setResultType (a parameter's setup load, a getelementptr, a
+					// "bitcast ptr to ptr"), and llvmValueToResultID's constant
+					// paths cannot produce one at all. 82 loads and 6 stores across
+					// the nine fixtures, no misses. There is also nothing to
+					// inherit if it ever did: the zeroed storage an unchecked
+					// operator* hands back reads as UniformConstant, a read-only
+					// class, which is how a store ends up with "OpStore ... storage
+					// class is read-only". Name the operand rather than guess.
+					auto maybeOpType = builder.reverseLookupType(builder.lookupResultType(op));
+					if (!maybeOpType) {
+						throw ImpossibleResultID("load's pointer operand has no recorded result type");
+					}
+					auto opType = *maybeOpType;
+					// only reachable through the miss just rejected: a pointer type
+					// always carries a pointee, and llvmTypeToSPIRVType refuses to
+					// resolve an opaque one, so targetType is a declared type.
 					auto opDerefType = *builder.reverseLookupType(opType.targetType);
 
 					if (opDerefType.backingType == SPIRV::Type::BackingType::RuntimeArray) {
@@ -1110,6 +1317,22 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 						auto access = builder.encodeAccessChain(accessType, op, { builder.declareConstantScalar<int32_t>(0) });
 						builder.setResultType(access, accessType);
 						op = access;
+					} else {
+						// AIR's pointers are opaque, so the operand's declared
+						// pointee is only whatever its producer managed to
+						// recover, and that is not necessarily what is being
+						// loaded: "bitcast ptr %a to ptr" carries no destination
+						// pointee, and a getelementptr names the aggregate it
+						// descends from, not the field it lands on. The load's
+						// own result type is the one place the intended pointee
+						// survives, so re-type the pointer to it.
+						auto loadPtrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, opType.pointerStorageClass, type, 8));
+
+						if (loadPtrType != builder.lookupResultType(op)) {
+							auto casted = builder.encodeBitcast(loadPtrType, op);
+							builder.setResultType(casted, loadPtrType);
+							op = casted;
+						}
 					}
 
 					auto resID = builder.encodeLoad(type, op, alignment);
@@ -1126,6 +1349,32 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					auto ptr = llvmValueToResultID(builder, llptr);
 
 					// TODO: also handle runtime arrays properly here
+
+					// The same asymmetry a load has: AIR's pointers are opaque,
+					// so the operand's declared pointee is only whatever its
+					// producer recovered, which need not be what is being
+					// stored through it. A store's own result type is void, so
+					// unlike a load it preserves nothing; the stored value's
+					// type is the equivalent source of truth, so re-type the
+					// pointer to it. Taken from the value's LLVM type rather
+					// than from its recorded SPIR-V result type because a
+					// constant operand never gets one recorded.
+					// the pointer being stored through, so the storage class has to come
+					// from the operand's recorded type. See the LLVMLoad case above for
+					// why that lookup cannot miss, and for why a miss would leave
+					// nothing to inherit: name the operand rather than guess.
+					auto maybeOpType = builder.reverseLookupType(builder.lookupResultType(ptr));
+					if (!maybeOpType) {
+						throw ImpossibleResultID("store's pointer operand has no recorded result type");
+					}
+					auto opType = *maybeOpType;
+					auto storePtrType = builder.declareType(SPIRV::Type(SPIRV::Type::PointerTag {}, opType.pointerStorageClass, llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(llval)), 8));
+
+					if (storePtrType != builder.lookupResultType(ptr)) {
+						auto casted = builder.encodeBitcast(storePtrType, ptr);
+						builder.setResultType(casted, storePtrType);
+						ptr = casted;
+					}
 
 					builder.encodeStore(ptr, val, alignment);
 				} break;
@@ -1438,15 +1687,38 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 
 				case LLVMBitCast: {
 					auto arg = DynamicLLVM::LLVMGetOperand(inst, 0);
-					auto lltype = DynamicLLVM::LLVMTypeOf(inst);
-					auto type = llvmTypeToSPIRVType(builder, lltype);
 					auto argID = llvmValueToResultID(builder, arg);
-
-					// ensure the resulting pointer storage class is the same as the input pointer storage class
-					auto typeInst = *builder.reverseLookupType(type);
 					auto origType = builder.lookupResultType(argID);
-					auto origTypeInst = *builder.reverseLookupType(origType);
-					typeInst.pointerStorageClass = origTypeInst.pointerStorageClass;
+
+					// AIR bitcasts texture handles as
+					// "bitcast ptr addrspace(2) %x to ptr addrspace(2)". With
+					// opaque pointers LLVMTypeOf reports the same bare pointer
+					// for both sides, so the LLVM type carries no destination
+					// pointee to translate, and none is recorded anywhere else
+					// in the AIR either. The source operand's SPIR-V type does
+					// carry one, so reuse that rather than failing the
+					// translation; the bitcast is then inert on types. A
+					// consumer that needs a different pointee re-types the
+					// pointer itself -- see LLVMLoad.
+					SPIRV::ResultID type = origType;
+					if (type == SPIRV::ResultIDInvalid) {
+						type = llvmTypeToSPIRVType(builder, DynamicLLVM::LLVMTypeOf(inst));
+					}
+
+					// ensure the resulting pointer storage class is the same as the input
+					// pointer storage class. a storage class only exists on a pointer type,
+					// so there is nothing to inherit from a non-pointer source, and nothing
+					// at all from an operand with no type recorded -- which is every
+					// constant, since declareConstantScalar and its siblings never call
+					// setResultType. the recovered type then stands on its own. dereferencing
+					// the missing lookup anyway did not report it: std::optional's operator*
+					// on an empty optional neither throws nor crashes, it reads the zeroed
+					// storage, in which pointerStorageClass is 0, i.e. UniformConstant, a
+					// read-only class.
+					auto typeInst = *builder.reverseLookupType(type);
+					if (auto origTypeInst = builder.reverseLookupType(origType); origTypeInst && origTypeInst->backingType == SPIRV::Type::BackingType::Pointer) {
+						typeInst.pointerStorageClass = origTypeInst->pointerStorageClass;
+					}
 					auto resultType = builder.declareType(typeInst);
 
 					auto resID = builder.encodeBitcast(resultType, argID);

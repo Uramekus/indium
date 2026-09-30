@@ -244,6 +244,20 @@ namespace Indium {
 		}
 	};
 
+	// VkBufferImageCopy's rowLength and imageHeight are in texels, and Vulkan
+	// infers a 0 in either from imageExtent, i.e. reads it as "tightly packed".
+	// pixelFormatToByteCount is 0 for every format whose texel is not a known byte
+	// count: the depth formats, the stencil-only ones and all the compressed ones.
+	// Dividing by that 0 is undefined behaviour, and 0 is the answer those formats
+	// want anyway, so keep the unknown out of the division.
+	static constexpr VkDeviceSize texelsPerRow(size_t bytesPerRow, size_t bytesPerPixel) {
+		return (bytesPerPixel == 0) ? 0 : (bytesPerRow / bytesPerPixel);
+	};
+
+	static constexpr VkDeviceSize texelRowsPerImage(size_t bytesPerImage, size_t bytesPerRow, size_t bytesPerPixel) {
+		return (bytesPerPixel == 0) ? 0 : (bytesPerImage / bytesPerRow);
+	};
+
 	static constexpr bool pixelFormatIsCompressed(PixelFormat pixelFormat) {
 		switch (pixelFormat) {
 			case PixelFormat::R8Unorm:
@@ -734,6 +748,8 @@ namespace Indium {
 
 	static constexpr VkShaderStageFlags functionTypeToVkShaderStageFlags(FunctionType functionType) {
 		switch (functionType) {
+			case FunctionType::Invalid:      throw BadEnumValue();
+
 			case FunctionType::Vertex:       return VK_SHADER_STAGE_VERTEX_BIT;
 			case FunctionType::Fragment:     return VK_SHADER_STAGE_FRAGMENT_BIT;
 			case FunctionType::Kernel:       return VK_SHADER_STAGE_COMPUTE_BIT;
