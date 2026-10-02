@@ -1654,9 +1654,14 @@ void Iridium::AIR::Function::analyze(SPIRV::Builder& builder, OutputInfo& output
 					builder.setResultType(resID, type);
 				} break;
 
+#if defined(LLVMUncondBr)
+				case LLVMUncondBr:
+				case LLVMCondBr:
+#else
 				case 70:
 				case 71:
-				case LLVMBr: {
+#endif
+				case 2: {
 					if (DynamicLLVM::LLVMIsConditional(inst)) {
 						auto condition = DynamicLLVM::LLVMGetCondition(inst);
 						auto trueLabel = DynamicLLVM::LLVMBasicBlockAsValue(DynamicLLVM::LLVMGetSuccessor(inst, 0));
